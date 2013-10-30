@@ -1,15 +1,19 @@
 import serial
 import logging
-import RPi.GPIO as GPIO
 import struct
 import time
 import socket
+import math
+import threading
+from RPi import GPIO
 
 EPOCH = 2208988800
 time_diff = None
 
-class NMEADevice(object):
+class NMEADevice(threading.Thread):
     def __init__(self, pin_number, com_port, baudrate=38400):
+        threading.Thread.__init__(self)
+        self.keep_running = False
         self.log = logging.getLogger("nmea")
         self.pin_number = pin_number
         self.pps_time = None
@@ -39,7 +43,7 @@ class NMEADevice(object):
         #  $GPVTG - vector track and speed over ground
         #  $GPZDA - data and time
         block = ''
-        while True:
+        while self.keep_running:
             block += self.com.read(512)
             if block == '':
                 continue
@@ -49,6 +53,8 @@ class NMEADevice(object):
             block = lines[-1]
 
     def run(self):
+        global time_diff
+        self.keep_running = True
         for line in self.readlines():
             if not line.startswith('$GPZDA'):
                 continue
@@ -61,8 +67,7 @@ class NMEADevice(object):
                     line[7:9], line[9:11], line[11:13],           # time
                     '0', '0', '0')                                # unused
             gps_time = time.mktime([int(i) for i in time_tuple])
-            time_diff = pps_time - gps_time
-            print pps_time, gps_time, time_diff
+            time_diff = (pps_time, gps_time, pps_time - gps_time)
 
     def pps_callback(self, channel):
         self.pps_time = time.time()
@@ -73,6 +78,8 @@ class NMEADevice(object):
         return t
 
     def close(self):
+        nmea.keep_running = False
+        self.join()
         self.com.close()
         GPIO.cleanup()
 
@@ -94,40 +101,47 @@ def decode_ntp(data):
             ('rec_time_frac',     msg[11]),
             ('trans_time_int',    msg[12]),
             ('trans_time_frac',   msg[13]),
+            ('rec_time',          (msg[10]-EPOCH) + (msg[11] * 1.0 / 0x100000000L)),
+            ('trans_time',        (msg[12]-EPOCH) + (msg[13] * 1.0 / 0x100000000L)),
         )
 
 class NTPServer(object):
     #print '\tTime=%s' % time.ctime(msg[ 6]-EPOCH)
     def __init__(self, addr="127.0.0.1", port=123):
+        self.log = logging.getLogger("ntp")
+        self.keep_running = False
         self.sock = socket.socket(socket.AF_INET,    # Internet
                                   socket.SOCK_DGRAM) # UDP
         self.sock.bind((addr, port))
-        self.keep_running = False
 
     def run(self):
+        global time_diff
+        while time_diff == None:
+            time.sleep(0.01)
+
         self.keep_running = True
         while self.keep_running:
             data, addr = self.sock.recvfrom(1024) # buffer size is 1024 bytes
-            r = time.time()+EPOCH # TODO: Get adjusted value
+            r_frac, r_int = math.modf( time.time()+EPOCH+time_diff[2] )
 
-            #msg = decode_ntp(data)
             orig_time = struct.unpack("!2I", data[24:32])
 
+            t_frac, t_int = math.modf( time.time()+EPOCH+time_diff[2] )
             out_values = (
-                (0b00 << 6) | 28, # No leap second, status OK. TODO: Why 28??????
-                1,                # Type primary reference (GPS)
-                236,        #TODO # Precision? Have no idea, but some value in
-                648,        #TODO # Estimated error? Again, I have not idea.
-                440,        #TODO # Drift rate? Wtf, why do I need all this...
-                0x47505300,       # "GPS\x00" - GPS UHF positioning satellite.
-                3591868484L,#TODO # Reference time integer part, should be previous second
-                0,                # Reference time fractional part, should be 0
-                orig_time[0],     # Originator time integer part
-                orig_time[1],     # Originator time fractional part
-                int(r)     ,      # Receive time integer part
-                3388663896L,#TODO # Receive time fractional part
-                int(r)     ,      # Receive time integer part
-                3388769450L,#TODO # Receive time fractional part
+                (0b00 << 6) | 28,         # No leap second, status OK. TODO: Why 28??????
+                1,                        # Type primary reference (GPS)
+                236,              #TODO   # Precision? Have no idea, but some value in
+                648,              #TODO   # Estimated error? Again, I have not idea.
+                440,              #TODO   # Drift rate? Wtf, why do I need all this...
+                0x47505300,               # "GPS\x00" - GPS UHF positioning satellite.
+                int(time_diff[0]),        # Reference time integer part, should be previous second
+                0,                        # Reference time fractional part, should be 0
+                orig_time[0],             # Originator time integer part
+                orig_time[1],             # Originator time fractional part
+                int(r_int)     ,          # Receive time integer part
+                int(r_frac*0x100000000L), # Receive time fractional part
+                int(t_int)     ,          # Receive time integer part
+                int(t_frac*0x100000000L), # Receive time fractional part
             )
             if data:
                 sent = self.sock.sendto(struct.pack('!2BH11I', *out_values), addr)
@@ -142,8 +156,8 @@ if __name__ == '__main__':
     nmea = NMEADevice(18, '/dev/ttyACM0')
 
     try:
-        nmea.run()
-        #ntp.run()
+        nmea.start()
+        ntp.run()
     finally:
         # clean up on CTRL+C or normal exit
         nmea.close()

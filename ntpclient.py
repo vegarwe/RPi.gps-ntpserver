@@ -22,6 +22,7 @@ data = '\x1b' + 47 * '\0'
 try:
     client.sendto( data, ( options.server, options.port ))
     data, address = client.recvfrom( 1024 )
+    n = time.time()
 
     print repr(data)
     fields = decode_ntp(data)
@@ -30,8 +31,10 @@ try:
 
     if data:
         print 'Response received from:', address
-        t = struct.unpack( '!12I', data )[10]
-        print '\tTime=%s' % time.ctime(t-EPOCH)
+        d = struct.unpack( '!12I', data )
+        t = d[10]
+        f = ((d[11] * 1000) / 0x100000000L)
+        print '\tTime=%s.%03i Now=%s' % (t-EPOCH, f, n)
 except gaierror:
     print "Network error "
 except error:
